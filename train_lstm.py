@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
+import vessl
 from tqdm import tqdm
 from chacha_dataset import get_dataloaders
 
@@ -115,6 +116,16 @@ def train(args):
             f"Bit Acc: {val_bit_acc:.4f} | "
             f"Exact Acc: {val_exact_acc:.6f}",
             flush=True,
+        )
+        vessl.log(
+            step=epoch + 1,
+            payload={
+                "lstm/train_loss": train_loss,
+                "lstm/val_loss": val_loss,
+                "lstm/bit_acc": val_bit_acc,
+                "lstm/exact_acc": val_exact_acc,
+                "lstm/lr": optimizer.param_groups[0]["lr"],
+            },
         )
 
     # Save results

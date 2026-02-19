@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
+import vessl
 from tqdm import tqdm
 from chacha_dataset import get_dataloaders
 
@@ -166,6 +167,16 @@ def train(args):
             f"Exact Acc: {val_exact_acc:.6f} | "
             f"LR: {current_lr:.2e}",
             flush=True,
+        )
+        vessl.log(
+            step=epoch + 1,
+            payload={
+                "transformer/train_loss": train_loss,
+                "transformer/val_loss": val_loss,
+                "transformer/bit_acc": val_bit_acc,
+                "transformer/exact_acc": val_exact_acc,
+                "transformer/lr": current_lr,
+            },
         )
 
     # Save results

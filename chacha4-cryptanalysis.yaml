@@ -1,0 +1,11 @@
+name: Chacha-prediction
+import:
+  /root/:
+    git:
+      url: github.com/SimHongJae/Chacha_Prediction.git
+      ref: main
+resources:
+  cluster: vessl-kr-a100-80g-sxm
+  preset: gpu-a100-80g-small
+image: quay.io/vessl-ai/torch:2.3.1-cuda12.1-r5
+run: apt-get update && apt-get install -y cargo && pip install tqdm numpy matplotlib vessl && cd my_chacha && cargo run --release -- 4 4000000 && cd .. && python train_mlp.py && python train_lstm.py && python train_transformer.py
