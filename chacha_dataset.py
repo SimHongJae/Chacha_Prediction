@@ -49,14 +49,106 @@ def u32_to_bits(value: np.ndarray) -> np.ndarray:
     return bits.astype(np.float32)
 
 
-# ── Byte-level dataset (paper approach) ──────────────────────────────
+# ── Block-level dataset (64-byte block -> next 64-byte block) ─────────
+
+BLOCK_BYTES = 64  # ChaCha block = 16 x u32 = 64 bytes
+
+class ChaChaBlockDataset(Dataset):
+    """Block-to-block prediction dataset.
+
+    Input: one 64-byte block as long tensor -> shape (64,)
+    Target: next 64-byte block as long tensor -> shape (64,)
+    Each byte is 0-255 (256-class per position).
+    """
+
+    def __init__(self, sequences, block_size: int = BLOCK_BYTES):
+        self.block_size = block_size
+        self.samples = []
+
+        for seq in sequences:
+            t = torch.from_numpy(seq.copy()).long()
+            n_blocks = len(t) // block_size
+            for b in range(n_blocks - 1):
+                x = t[b * block_size : (b + 1) * block_size]
+                y = t[(b + 1) * block_size : (b + 2) * block_size]
+                self.samples.append((x, y))
+
+        print(f"  Created {len(self.samples):,} block pairs (block_size={block_size})")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]  # (x: (64,), y: (64,))
+
+
+class ChaChaBlockToByteDataset(Dataset):
+    """Block-to-next-byte prediction dataset.
+
+    Input: one 64-byte block as long tensor -> shape (64,)
+    Target: first byte of next block as long scalar (0-255)
+    """
+
+    def __init__(self, sequences, block_size: int = BLOCK_BYTES):
+        self.block_size = block_size
+        self.samples = []
+
+        for seq in sequences:
+            t = torch.from_numpy(seq.copy()).long()
+            n_blocks = len(t) // block_size
+            for b in range(n_blocks - 1):
+                x = t[b * block_size : (b + 1) * block_size]          # (64,)
+                y = t[(b + 1) * block_size]                            # scalar
+                self.samples.append((x, y))
+
+        print(f"  Created {len(self.samples):,} block->byte pairs (block_size={block_size})")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]  # (x: (64,), y: scalar)
+
+
+def get_block_dataloaders(
+    filepath: str,
+    mode: str = "block64",
+    batch_size: int = 1024,
+    train_ratio: float = 0.8,
+    num_workers: int = 4,
+):
+    """Load data as bytes and return train/val DataLoaders.
+
+    mode="block64": predict next 64-byte block
+    mode="byte1":   predict first byte of next block
+    """
+    sequences = load_sequences_as_bytes(filepath)
+
+    split = int(len(sequences) * train_ratio)
+    train_seqs = sequences[:split]
+    val_seqs = sequences[split:]
+
+    ds_cls = ChaChaBlockDataset if mode == "block64" else ChaChaBlockToByteDataset
+
+    print(f"Mode: {mode}")
+    print("Train set:")
+    train_ds = ds_cls(train_seqs)
+    print("Val set:")
+    val_ds = ds_cls(val_seqs)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
+    )
+    return train_loader, val_loader
+
+
+# ── Byte-level dataset (paper approach, kept for compatibility) ───────
 
 class ChaChaByteDataset(Dataset):
-    """Sliding window dataset for next-byte prediction (256-class).
-
-    Input: previous `window_size` bytes as long tensor -> shape (window_size,)
-    Target: next byte as long scalar (0-255)
-    """
+    """Sliding window dataset for next-byte prediction (256-class)."""
 
     def __init__(self, sequences, window_size: int = 100):
         self.window_size = window_size
@@ -64,7 +156,7 @@ class ChaChaByteDataset(Dataset):
         self.seq_data = []
 
         for seq in sequences:
-            t = torch.from_numpy(seq.copy()).long()  # (num_bytes,)
+            t = torch.from_numpy(seq.copy()).long()
             self.seq_data.append(t)
             seq_idx = len(self.seq_data) - 1
             for pos in range(len(seq) - window_size):
@@ -76,8 +168,8 @@ class ChaChaByteDataset(Dataset):
     def __getitem__(self, idx):
         seq_idx, pos = self.samples[idx]
         data = self.seq_data[seq_idx]
-        x = data[pos : pos + self.window_size]      # (window_size,)
-        y = data[pos + self.window_size]             # scalar
+        x = data[pos : pos + self.window_size]
+        y = data[pos + self.window_size]
         return x, y
 
 
