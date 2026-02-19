@@ -1,9 +1,11 @@
 import argparse
 import math
+import sys
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 from chacha_dataset import get_dataloaders
 
 
@@ -129,7 +131,8 @@ def train(args):
         epoch_loss = 0.0
         n_samples = 0
 
-        for x, y in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", file=sys.stdout)
+        for x, y in pbar:
             x, y = x.to(device), y.to(device)
             logits = model(x)
             loss = criterion(logits, y)
@@ -142,6 +145,7 @@ def train(args):
 
             epoch_loss += loss.item() * x.size(0)
             n_samples += x.size(0)
+            pbar.set_postfix(loss=f"{epoch_loss/n_samples:.6f}")
 
         train_loss = epoch_loss / n_samples
         val_loss, val_bit_acc, val_exact_acc, per_bit_acc = evaluate(
@@ -160,7 +164,8 @@ def train(args):
             f"Val Loss: {val_loss:.6f} | "
             f"Bit Acc: {val_bit_acc:.4f} | "
             f"Exact Acc: {val_exact_acc:.6f} | "
-            f"LR: {current_lr:.2e}"
+            f"LR: {current_lr:.2e}",
+            flush=True,
         )
 
     # Save results
