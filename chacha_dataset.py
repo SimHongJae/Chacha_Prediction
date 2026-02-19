@@ -29,8 +29,8 @@ class ChaChaSequenceDataset(Dataset):
     def __init__(self, data: np.ndarray, window_size: int = 4, flatten: bool = True):
         self.window_size = window_size
         self.flatten = flatten
-        # Convert all data to bits once
-        self.bits = u32_to_bits(data)  # shape (N, 32)
+        # Convert all data to bits once, store as tensor
+        self.bits = torch.from_numpy(u32_to_bits(data))  # shape (N, 32)
         self.length = len(data) - window_size
 
     def __len__(self):
@@ -41,7 +41,7 @@ class ChaChaSequenceDataset(Dataset):
         y = self.bits[idx + self.window_size]  # (32,)
         if self.flatten:
             x = x.reshape(-1)  # (window_size * 32,)
-        return torch.from_numpy(x), torch.from_numpy(y)
+        return x, y
 
 
 def get_dataloaders(
@@ -50,7 +50,7 @@ def get_dataloaders(
     batch_size: int = 1024,
     train_ratio: float = 0.8,
     flatten: bool = True,
-    num_workers: int = 0,
+    num_workers: int = 4,
 ):
     """Load data and return train/val DataLoaders."""
     data = load_binary_u32(filepath)

@@ -160,7 +160,7 @@ if __name__ == "__main__":
     parser.add_argument("--data", default="dataset/chacha4_seq.bin")
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--window", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden", type=int, default=128)

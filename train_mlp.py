@@ -158,7 +158,7 @@ if __name__ == "__main__":
     parser.add_argument("--data", default="dataset/chacha4_seq.bin", help="Path to binary data file")
     parser.add_argument("--rounds", type=int, default=4, help="ChaCha round count (for labeling)")
     parser.add_argument("--window", type=int, default=4, help="Sliding window size")
-    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
