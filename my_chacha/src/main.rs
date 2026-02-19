@@ -1,3 +1,4 @@
+use rand::Rng;
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -46,28 +47,23 @@ impl ChaCha {
     pub fn next_block(&mut self) -> [u32; 16] {
         let mut working_state = self.state;
 
-        // Double rounds = rounds / 2
         for _ in 0..self.rounds / 2 {
-            // Column rounds
             Self::quarter_round(&mut working_state, 0, 4, 8, 12);
             Self::quarter_round(&mut working_state, 1, 5, 9, 13);
             Self::quarter_round(&mut working_state, 2, 6, 10, 14);
             Self::quarter_round(&mut working_state, 3, 7, 11, 15);
 
-            // Diagonal rounds
             Self::quarter_round(&mut working_state, 0, 5, 10, 15);
             Self::quarter_round(&mut working_state, 1, 6, 11, 12);
             Self::quarter_round(&mut working_state, 2, 7, 8, 13);
             Self::quarter_round(&mut working_state, 3, 4, 9, 14);
         }
 
-        // Feed-forward: add initial state
         let mut output = [0u32; 16];
         for i in 0..16 {
             output[i] = working_state[i].wrapping_add(self.state[i]);
         }
 
-        // Increment block counter
         self.state[12] = self.state[12].wrapping_add(1);
         if self.state[12] == 0 {
             self.state[13] = self.state[13].wrapping_add(1);
@@ -77,31 +73,30 @@ impl ChaCha {
     }
 }
 
+/// Binary format:
+///   For each sequence:
+///     [num_words: u32] [word0: u32] [word1: u32] ... [wordN: u32]
+///   num_words=0 marks end of file (not written, just EOF)
+///
+/// This way Python knows where each sequence starts/ends.
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <rounds> <num_u32_words>", args[0]);
-        eprintln!("Example: {} 4 4000000", args[0]);
+    if args.len() != 4 {
+        eprintln!("Usage: {} <rounds> <num_sequences> <blocks_per_seq>", args[0]);
+        eprintln!("Example: {} 4 100000 4", args[0]);
+        eprintln!("  -> 100K sequences, each with 4 blocks (64 u32 words)");
         std::process::exit(1);
     }
 
-    let rounds: u32 = args[1].parse().expect("Invalid rounds number");
-    let num_words: usize = args[2].parse().expect("Invalid word count");
+    let rounds: u32 = args[1].parse().expect("Invalid rounds");
+    let num_sequences: usize = args[2].parse().expect("Invalid num_sequences");
+    let blocks_per_seq: usize = args[3].parse().expect("Invalid blocks_per_seq");
 
-    assert!(rounds % 2 == 0, "Rounds must be even (2, 4, 6, 8, ...)");
+    assert!(rounds % 2 == 0, "Rounds must be even");
 
-    // Fixed key and nonce for reproducibility
-    let key: [u8; 32] = [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-    ];
-    let nonce: [u8; 8] = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+    let words_per_seq = blocks_per_seq * 16; // 16 u32 per block
+    let mut rng = rand::thread_rng();
 
-    let mut chacha = ChaCha::new(key, nonce, rounds);
-
-    // Create dataset directory
     let dataset_dir = "../dataset";
     fs::create_dir_all(dataset_dir).expect("Failed to create dataset directory");
 
@@ -109,34 +104,45 @@ fn main() {
     let file = File::create(&filename).expect("Failed to create output file");
     let mut writer = BufWriter::new(file);
 
-    let blocks_needed = (num_words + 15) / 16; // 16 u32 words per block
-    let mut words_written: usize = 0;
+    let mut total_words: usize = 0;
 
-    for block_idx in 0..blocks_needed {
-        let output = chacha.next_block();
+    for seq_idx in 0..num_sequences {
+        // Random key and nonce for each sequence
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 8];
+        rng.fill(&mut key);
+        rng.fill(&mut nonce);
 
-        for &word in &output {
-            if words_written >= num_words {
-                break;
+        let mut chacha = ChaCha::new(key, nonce, rounds);
+
+        // Write sequence length header
+        writer.write_all(&(words_per_seq as u32).to_le_bytes()).unwrap();
+
+        // Write all words for this sequence
+        for _ in 0..blocks_per_seq {
+            let output = chacha.next_block();
+            for &word in &output {
+                writer.write_all(&word.to_le_bytes()).unwrap();
             }
-            writer.write_all(&word.to_le_bytes()).unwrap();
-            words_written += 1;
         }
 
-        if (block_idx + 1) % 100_000 == 0 {
+        total_words += words_per_seq;
+
+        if (seq_idx + 1) % 10_000 == 0 {
             eprintln!(
-                "Progress: {} blocks, {} words written",
-                block_idx + 1,
-                words_written
+                "Progress: {}/{} sequences ({} words)",
+                seq_idx + 1,
+                num_sequences,
+                total_words
             );
         }
     }
 
     writer.flush().unwrap();
 
-    let file_size_mb = (words_written * 4) as f64 / (1024.0 * 1024.0);
+    let file_size_mb = ((num_sequences * (1 + words_per_seq)) * 4) as f64 / (1024.0 * 1024.0);
     eprintln!(
-        "Done! {} created ({} u32 words, {:.1} MB)",
-        filename, words_written, file_size_mb
+        "Done! {} created ({} sequences x {} words = {} total, {:.1} MB)",
+        filename, num_sequences, words_per_seq, total_words, file_size_mb
     );
 }

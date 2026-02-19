@@ -3,44 +3,71 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 
-def load_binary_u32(filepath: str) -> np.ndarray:
-    """Load binary file of u32 little-endian values into numpy array."""
-    data = np.fromfile(filepath, dtype=np.uint32)
-    print(f"Loaded {len(data):,} u32 words from {filepath}")
-    return data
+def load_sequences(filepath: str):
+    """Load binary file with per-sequence length headers.
+
+    Format: [len: u32] [word0..wordN: u32] [len: u32] [word0..wordN: u32] ...
+    Returns list of numpy arrays, each shape (seq_len,) dtype uint32.
+    """
+    raw = np.fromfile(filepath, dtype=np.uint32)
+    sequences = []
+    i = 0
+    while i < len(raw):
+        seq_len = int(raw[i])
+        i += 1
+        if i + seq_len > len(raw):
+            break
+        sequences.append(raw[i : i + seq_len])
+        i += seq_len
+
+    total_words = sum(len(s) for s in sequences)
+    print(f"Loaded {len(sequences):,} sequences ({total_words:,} total words) from {filepath}")
+    return sequences
 
 
 def u32_to_bits(value: np.ndarray) -> np.ndarray:
-    """Convert u32 array to bit representation. Shape: (*) -> (*, 32)."""
+    """Convert u32 array to bit representation. Shape: (N,) -> (N, 32)."""
     bits = np.unpackbits(
-        value.view(np.uint8).reshape(*value.shape, 4)[:, ::-1],  # big-endian bit order
+        value.view(np.uint8).reshape(*value.shape, 4)[:, ::-1],
         axis=-1,
     )
     return bits.astype(np.float32)
 
 
 class ChaChaSequenceDataset(Dataset):
-    """Sliding window dataset for next-u32 prediction.
+    """Sliding window dataset for next-u32 prediction with multiple sequences.
 
-    Input: previous `window_size` u32 words as bits -> shape (window_size, 32) or (window_size*32,)
+    Each sequence is independent (no cross-sequence windows).
+    Input: previous `window_size` u32 words as bits
     Target: next u32 word as bits -> shape (32,)
     """
 
-    def __init__(self, data: np.ndarray, window_size: int = 4, flatten: bool = True):
+    def __init__(self, sequences, window_size: int = 4, flatten: bool = True):
         self.window_size = window_size
         self.flatten = flatten
-        # Convert all data to bits once, store as tensor
-        self.bits = torch.from_numpy(u32_to_bits(data))  # shape (N, 32)
-        self.length = len(data) - window_size
+
+        # Build index: (seq_idx, position_in_seq) for each valid sample
+        self.samples = []
+        self.seq_bits = []
+
+        for seq in sequences:
+            bits = torch.from_numpy(u32_to_bits(seq))  # (seq_len, 32)
+            self.seq_bits.append(bits)
+            seq_idx = len(self.seq_bits) - 1
+            # Valid positions: 0 to len(seq) - window_size - 1
+            for pos in range(len(seq) - window_size):
+                self.samples.append((seq_idx, pos))
 
     def __len__(self):
-        return self.length
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        x = self.bits[idx : idx + self.window_size]  # (window_size, 32)
-        y = self.bits[idx + self.window_size]  # (32,)
+        seq_idx, pos = self.samples[idx]
+        bits = self.seq_bits[seq_idx]
+        x = bits[pos : pos + self.window_size]       # (window_size, 32)
+        y = bits[pos + self.window_size]              # (32,)
         if self.flatten:
-            x = x.reshape(-1)  # (window_size * 32,)
+            x = x.reshape(-1)                         # (window_size * 32,)
         return x, y
 
 
@@ -53,14 +80,14 @@ def get_dataloaders(
     num_workers: int = 4,
 ):
     """Load data and return train/val DataLoaders."""
-    data = load_binary_u32(filepath)
+    sequences = load_sequences(filepath)
 
-    split = int(len(data) * train_ratio)
-    train_data = data[:split]
-    val_data = data[split:]
+    split = int(len(sequences) * train_ratio)
+    train_seqs = sequences[:split]
+    val_seqs = sequences[split:]
 
-    train_ds = ChaChaSequenceDataset(train_data, window_size, flatten=flatten)
-    val_ds = ChaChaSequenceDataset(val_data, window_size, flatten=flatten)
+    train_ds = ChaChaSequenceDataset(train_seqs, window_size, flatten=flatten)
+    val_ds = ChaChaSequenceDataset(val_seqs, window_size, flatten=flatten)
 
     print(f"Train samples: {len(train_ds):,}, Val samples: {len(val_ds):,}")
 
