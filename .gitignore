@@ -1,0 +1,20 @@
+# Rust
+my_chacha/target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Dataset (binary, large)
+dataset/*.bin
+
+# Model weights
+*.pt
+
+# Training outputs
+*_results.png
+
+# IDE
+.vscode/
+.idea/
