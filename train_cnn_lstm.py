@@ -144,7 +144,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, criterion, devi
         metrics = evaluate(model, val_loader, criterion, device)
 
         if scheduler is not None:
-            scheduler.step(metrics["val_loss"] if hasattr(scheduler, "patience") else metrics["loss"])
+            scheduler.step(metrics["loss"])
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(metrics["loss"])
