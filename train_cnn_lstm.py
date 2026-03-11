@@ -1,12 +1,15 @@
-"""CNN+LSTM block-level prediction model.
+"""CNN+LSTM fixed-key next-byte prediction for ChaCha keystream analysis.
 
-Two modes:
-  --mode block64 : 64-byte block -> next 64-byte block (64 x 256-class)
-  --mode byte1   : 64-byte block -> next 1 byte (256-class)
+Task: Given a fixed key, observe W consecutive keystream bytes and predict
+      the next byte (256-class classification).
 
-CNN: Conv1d(256,64,k=5) -> Pool(2) -> Conv1d(64,128,k=3) -> Pool(2)
-LSTM: hidden=128
-Metric: byte accuracy (baseline Pg = 1/256 = 0.39%)
+Model: Embedding -> CNN (Conv1d) -> LSTM -> FC -> 256 logits
+Metric: Pml (prediction-at-most-likely), baseline Pg = 1/256 ≈ 0.39%
+
+Data file formats supported:
+  --flat : raw byte dump (no headers)  ← single fixed-key stream
+  default: u32 length-prefixed multi-sequence format (all sequences
+           concatenated into one stream before use)
 """
 
 import argparse
@@ -15,144 +18,81 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import numpy as np
 import vessl
 from tqdm import tqdm
-from chacha_dataset import get_block_dataloaders
+from chacha_dataset import get_stream_dataloaders
 
 
-BLOCK_BYTES = 64
-
+# ── Model ─────────────────────────────────────────────────────────────
 
 class CNN_LSTM(nn.Module):
-    def __init__(self, vocab_size=256, block_size=64, lstm_hidden=128, output_bytes=64):
+    """Embedding -> CNN -> LSTM -> FC for next-byte prediction.
+
+    Args:
+        vocab_size:     256 (byte alphabet)
+        window_size:    number of input bytes (sequence length for CNN/LSTM)
+        embed_dim:      byte embedding dimension
+        cnn_channels:   list of output channels for successive Conv1d layers
+        kernel_size:    conv kernel size (same for all layers)
+        lstm_hidden:    LSTM hidden state size
+        lstm_layers:    number of stacked LSTM layers
+        lstm_dropout:   dropout between LSTM layers (only if lstm_layers > 1)
+    """
+
+    def __init__(
+        self,
+        vocab_size: int = 256,
+        window_size: int = 64,
+        embed_dim: int = 16,
+        cnn_channels: list = None,
+        kernel_size: int = 3,
+        lstm_hidden: int = 256,
+        lstm_layers: int = 2,
+        lstm_dropout: float = 0.2,
+    ):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.block_size = block_size
-        self.output_bytes = output_bytes  # 64 or 1
+        if cnn_channels is None:
+            cnn_channels = [64, 128]
 
-        # CNN feature extractor
-        self.conv1 = nn.Conv1d(vocab_size, 64, kernel_size=5)
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=3)
-        self.pool = nn.MaxPool1d(2)
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
 
-        # After conv1: 64-4=60, pool: 30
-        # After conv2: 30-2=28, pool: 14
-        self.lstm = nn.LSTM(128, lstm_hidden, batch_first=True)
+        # Build CNN: each block = Conv1d -> ReLU -> MaxPool1d(2)
+        cnn_layers = []
+        in_ch = embed_dim
+        for out_ch in cnn_channels:
+            cnn_layers += [
+                nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=kernel_size // 2),
+                nn.ReLU(),
+                nn.MaxPool1d(2),
+            ]
+            in_ch = out_ch
+        self.cnn = nn.Sequential(*cnn_layers)
+        self.cnn_out_ch = in_ch
 
-        # Output head
-        self.fc1 = nn.Linear(lstm_hidden, 256)
-        self.fc2 = nn.Linear(256, output_bytes * vocab_size)
+        self.lstm = nn.LSTM(
+            input_size=self.cnn_out_ch,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=lstm_dropout if lstm_layers > 1 else 0.0,
+        )
+
+        self.fc = nn.Linear(lstm_hidden, vocab_size)
 
     def forward(self, x):
-        # x: (batch, 64) long tensor of byte values 0-255
-        x = F.one_hot(x, self.vocab_size).float()  # (batch, 64, 256)
-        x = x.permute(0, 2, 1)                     # (batch, 256, 64)
-
-        x = self.pool(F.relu(self.conv1(x)))        # (batch, 64, 30)
-        x = self.pool(F.relu(self.conv2(x)))        # (batch, 128, 14)
-
-        x = x.permute(0, 2, 1)                     # (batch, 14, 128)
+        # x: (batch, window_size)  long
+        x = self.embedding(x)           # (batch, window_size, embed_dim)
+        x = x.permute(0, 2, 1)          # (batch, embed_dim, window_size)
+        x = self.cnn(x)                 # (batch, cnn_out_ch, seq_len')
+        x = x.permute(0, 2, 1)          # (batch, seq_len', cnn_out_ch)
         out, _ = self.lstm(x)
-        out = out[:, -1, :]                         # (batch, 128)
-
-        out = F.relu(self.fc1(out))                 # (batch, 256)
-        out = self.fc2(out)                         # (batch, output_bytes*256)
-
-        if self.output_bytes == 1:
-            return out                              # (batch, 256)
-        else:
-            return out.view(-1, self.output_bytes, self.vocab_size)  # (batch, 64, 256)
+        out = out[:, -1, :]             # (batch, lstm_hidden)
+        return self.fc(out)             # (batch, 256)
 
 
-# ── block64 mode: predict next 64 bytes ──────────────────────────────
+# ── Evaluate ──────────────────────────────────────────────────────────
 
-def evaluate_block64(model, loader, criterion, device):
-    model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_bytes = 0
-    total_exact = 0
-    total_blocks = 0
-
-    with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)                              # (batch, 64, 256)
-            loss = criterion(logits.view(-1, 256), y.view(-1))
-            total_loss += loss.item() * x.size(0)
-
-            preds = logits.argmax(dim=2)                   # (batch, 64)
-            correct = (preds == y)
-            total_correct += correct.sum().item()
-            total_bytes += y.numel()
-            total_exact += correct.all(dim=1).sum().item()
-            total_blocks += x.size(0)
-
-    return {
-        "loss": total_loss / total_blocks,
-        "byte_acc": total_correct / total_bytes,
-        "exact_acc": total_exact / total_blocks,
-    }
-
-
-def train_block64(model, train_loader, val_loader, optimizer, criterion, device, args):
-    pg = 1.0 / 256
-    history = {"train_loss": [], "val_loss": [], "val_byte_acc": [], "val_exact_acc": []}
-
-    for epoch in range(args.epochs):
-        model.train()
-        epoch_loss = 0.0
-        n_samples = 0
-
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", file=sys.stdout)
-        for x, y in pbar:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = criterion(logits.view(-1, 256), y.view(-1))
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item() * x.size(0)
-            n_samples += x.size(0)
-            pbar.set_postfix(loss=f"{epoch_loss/n_samples:.6f}")
-
-        train_loss = epoch_loss / n_samples
-        metrics = evaluate_block64(model, val_loader, criterion, device)
-
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(metrics["loss"])
-        history["val_byte_acc"].append(metrics["byte_acc"])
-        history["val_exact_acc"].append(metrics["exact_acc"])
-
-        print(
-            f"Epoch {epoch+1:3d}/{args.epochs} | "
-            f"Train Loss: {train_loss:.6f} | "
-            f"Val Loss: {metrics['loss']:.6f} | "
-            f"Byte Acc: {metrics['byte_acc']:.4%} (Pg: {pg:.4%}) | "
-            f"Exact Match: {metrics['exact_acc']:.6%}",
-            flush=True,
-        )
-        vessl.log(
-            step=epoch + 1,
-            payload={
-                "block64/train_loss": train_loss,
-                "block64/val_loss": metrics["loss"],
-                "block64/byte_acc": metrics["byte_acc"],
-                "block64/byte_acc_over_pg": metrics["byte_acc"] / pg,
-                "block64/exact_match": metrics["exact_acc"],
-                "block64/lr": optimizer.param_groups[0]["lr"],
-            },
-        )
-
-    return history
-
-
-# ── byte1 mode: predict next 1 byte ──────────────────────────────────
-
-def evaluate_byte1(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -161,10 +101,9 @@ def evaluate_byte1(model, loader, criterion, device):
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            logits = model(x)                              # (batch, 256)
+            logits = model(x)                       # (batch, 256)
             loss = criterion(logits, y)
             total_loss += loss.item() * x.size(0)
-
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total_samples += x.size(0)
@@ -175,7 +114,9 @@ def evaluate_byte1(model, loader, criterion, device):
     }
 
 
-def train_byte1(model, train_loader, val_loader, optimizer, criterion, device, args):
+# ── Train ─────────────────────────────────────────────────────────────
+
+def train(model, train_loader, val_loader, optimizer, scheduler, criterion, device, args):
     pg = 1.0 / 256
     history = {"train_loss": [], "val_loss": [], "val_pml": []}
 
@@ -192,6 +133,7 @@ def train_byte1(model, train_loader, val_loader, optimizer, criterion, device, a
 
             optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             epoch_loss += loss.item() * x.size(0)
@@ -199,64 +141,65 @@ def train_byte1(model, train_loader, val_loader, optimizer, criterion, device, a
             pbar.set_postfix(loss=f"{epoch_loss/n_samples:.6f}")
 
         train_loss = epoch_loss / n_samples
-        metrics = evaluate_byte1(model, val_loader, criterion, device)
+        metrics = evaluate(model, val_loader, criterion, device)
+
+        if scheduler is not None:
+            scheduler.step(metrics["val_loss"] if hasattr(scheduler, "patience") else metrics["loss"])
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(metrics["loss"])
         history["val_pml"].append(metrics["pml"])
 
+        lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch+1:3d}/{args.epochs} | "
             f"Train Loss: {train_loss:.6f} | "
             f"Val Loss: {metrics['loss']:.6f} | "
-            f"Pml: {metrics['pml']:.4%} (Pg: {pg:.4%})",
+            f"Pml: {metrics['pml']:.4%} (Pg: {pg:.4%}) | "
+            f"Pml/Pg: {metrics['pml']/pg:.4f}x | "
+            f"LR: {lr:.2e}",
             flush=True,
         )
         vessl.log(
             step=epoch + 1,
             payload={
-                "byte1/train_loss": train_loss,
-                "byte1/val_loss": metrics["loss"],
-                "byte1/pml": metrics["pml"],
-                "byte1/pml_over_pg": metrics["pml"] / pg,
-                "byte1/lr": optimizer.param_groups[0]["lr"],
+                "train_loss": train_loss,
+                "val_loss": metrics["loss"],
+                "pml": metrics["pml"],
+                "pml_over_pg": metrics["pml"] / pg,
+                "lr": lr,
             },
         )
 
     return history
 
 
-# ── Plotting ──────────────────────────────────────────────────────────
+# ── Plot ──────────────────────────────────────────────────────────────
 
-def plot_results(history, mode, pg, rounds):
+def plot_results(history, args):
+    pg = 1.0 / 256
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     axes[0].plot(history["train_loss"], label="Train")
     axes[0].plot(history["val_loss"], label="Val")
     axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].set_title(f"CNN+LSTM ({mode}) - ChaCha{rounds} Loss")
+    axes[0].set_ylabel("Cross-Entropy Loss")
+    axes[0].set_title(f"CNN+LSTM - ChaCha{args.rounds} (window={args.window_size})")
     axes[0].legend()
     axes[0].grid(True)
 
-    epochs = range(1, len(history["val_loss"]) + 1)
-    if mode == "block64":
-        acc_data = [p * 100 for p in history["val_byte_acc"]]
-        acc_label = "Byte Acc"
-    else:
-        acc_data = [p * 100 for p in history["val_pml"]]
-        acc_label = "Pml"
-
-    axes[1].plot(epochs, acc_data, label=acc_label, marker="o", markersize=3)
+    epochs = range(1, len(history["val_pml"]) + 1)
+    pml_pct = [p * 100 for p in history["val_pml"]]
+    axes[1].plot(epochs, pml_pct, label="Pml", marker="o", markersize=3)
     axes[1].axhline(y=pg * 100, color="r", linestyle="--", label=f"Pg ({pg:.2%})")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Accuracy (%)")
-    axes[1].set_title(f"CNN+LSTM ({mode}) - ChaCha{rounds}")
+    axes[1].set_title(f"CNN+LSTM Next-Byte Prediction - ChaCha{args.rounds}")
     axes[1].legend()
     axes[1].grid(True)
 
     plt.tight_layout()
-    fname = f"cnn_lstm_{mode}_chacha{rounds}_results.png"
+    fname = f"cnn_lstm_chacha{args.rounds}_w{args.window_size}_results.png"
     plt.savefig(fname, dpi=150)
     print(f"Plot saved to {fname}")
     plt.close()
@@ -266,49 +209,77 @@ def plot_results(history, mode, pg, rounds):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    print(f"Mode: {args.mode}")
+    print(f"Device: {device}")
+    print(f"ChaCha rounds: {args.rounds}")
+    print(f"Window size: {args.window_size} bytes")
+    print(f"Data file: {args.data}  (flat={args.flat})")
 
-    output_bytes = BLOCK_BYTES if args.mode == "block64" else 1
-
-    train_loader, val_loader = get_block_dataloaders(
-        args.data,
-        mode=args.mode,
+    train_loader, val_loader = get_stream_dataloaders(
+        filepath=args.data,
+        window_size=args.window_size,
         batch_size=args.batch_size,
+        train_ratio=0.8,
+        num_workers=args.num_workers,
+        flat=args.flat,
     )
 
     model = CNN_LSTM(
-        vocab_size=256, block_size=BLOCK_BYTES,
-        lstm_hidden=128, output_bytes=output_bytes,
+        vocab_size=256,
+        window_size=args.window_size,
+        embed_dim=args.embed_dim,
+        cnn_channels=args.cnn_channels,
+        kernel_size=args.kernel_size,
+        lstm_hidden=args.lstm_hidden,
+        lstm_layers=args.lstm_layers,
+        lstm_dropout=args.lstm_dropout,
     ).to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    pg = 1.0 / 256
-    print(f"Random guess baseline Pg = {pg:.4%}")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {n_params:,}")
+    print(f"Random guess baseline Pg = {1/256:.4%}")
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=3, verbose=True
+    )
 
-    if args.mode == "block64":
-        history = train_block64(model, train_loader, val_loader, optimizer, criterion, device, args)
-    else:
-        history = train_byte1(model, train_loader, val_loader, optimizer, criterion, device, args)
+    history = train(model, train_loader, val_loader, optimizer, scheduler, criterion, device, args)
+    plot_results(history, args)
 
-    plot_results(history, args.mode, pg, args.rounds)
-
-    model_fname = f"cnn_lstm_{args.mode}_chacha{args.rounds}.pt"
-    torch.save(model.state_dict(), model_fname)
-    print(f"Model saved to {model_fname}")
+    fname = f"cnn_lstm_chacha{args.rounds}_w{args.window_size}.pt"
+    torch.save(model.state_dict(), fname)
+    print(f"Model saved to {fname}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train CNN+LSTM on ChaCha block prediction")
-    parser.add_argument("--data", default="dataset/chacha4_seq.bin")
-    parser.add_argument("--rounds", type=int, default=4)
-    parser.add_argument("--mode", choices=["block64", "byte1"], default="block64",
-                        help="block64: predict next 64-byte block, byte1: predict next 1 byte")
+    parser = argparse.ArgumentParser(
+        description="CNN+LSTM next-byte prediction on ChaCha fixed-key keystream"
+    )
+    # Data
+    parser.add_argument("--data", default="dataset/chacha4_stream.bin",
+                        help="Path to keystream binary file")
+    parser.add_argument("--flat", action="store_true",
+                        help="File is raw bytes (no u32 length headers)")
+    parser.add_argument("--rounds", type=int, default=4,
+                        help="Number of ChaCha rounds (for labeling only)")
+    parser.add_argument("--window-size", type=int, default=64,
+                        help="Sliding window size (bytes fed as input)")
+
+    # Training
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--num-workers", type=int, default=4)
+
+    # Model architecture
+    parser.add_argument("--embed-dim", type=int, default=16)
+    parser.add_argument("--cnn-channels", type=int, nargs="+", default=[64, 128],
+                        help="Output channels for each CNN layer (e.g. --cnn-channels 64 128 256)")
+    parser.add_argument("--kernel-size", type=int, default=3)
+    parser.add_argument("--lstm-hidden", type=int, default=256)
+    parser.add_argument("--lstm-layers", type=int, default=2)
+    parser.add_argument("--lstm-dropout", type=float, default=0.2)
+
     args = parser.parse_args()
     main(args)

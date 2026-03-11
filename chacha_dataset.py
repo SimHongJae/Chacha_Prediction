@@ -3,6 +3,19 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 
+# ── Raw stream loaders ────────────────────────────────────────────────
+
+def load_flat_bytes(filepath: str) -> np.ndarray:
+    """Load a flat binary file as a single byte stream.
+
+    Expects raw bytes with no length headers.
+    Returns numpy array shape (N,) dtype uint8.
+    """
+    data = np.fromfile(filepath, dtype=np.uint8)
+    print(f"Loaded flat stream: {len(data):,} bytes from {filepath}")
+    return data
+
+
 def load_sequences(filepath: str):
     """Load binary file with per-sequence length headers.
 
@@ -26,45 +39,111 @@ def load_sequences(filepath: str):
 
 
 def load_sequences_as_bytes(filepath: str):
-    """Load binary file and convert u32 sequences to byte sequences.
-
-    Returns list of numpy arrays, each shape (seq_len*4,) dtype uint8.
-    """
+    """Load binary file and convert u32 sequences to byte sequences."""
     sequences = load_sequences(filepath)
-    byte_sequences = []
-    for seq in sequences:
-        byte_sequences.append(seq.view(np.uint8))  # u32 LE -> 4 bytes each
-
+    byte_sequences = [seq.view(np.uint8) for seq in sequences]
     total_bytes = sum(len(s) for s in byte_sequences)
     print(f"Converted to bytes: {len(byte_sequences):,} sequences ({total_bytes:,} total bytes)")
     return byte_sequences
 
 
-def u32_to_bits(value: np.ndarray) -> np.ndarray:
-    """Convert u32 array to bit representation. Shape: (N,) -> (N, 32)."""
-    bits = np.unpackbits(
-        value.view(np.uint8).reshape(*value.shape, 4)[:, ::-1],
-        axis=-1,
+def load_single_stream_as_bytes(filepath: str) -> np.ndarray:
+    """Load multi-sequence binary file, concatenate all into one byte stream.
+
+    Use this when the file contains one key's worth of data across multiple
+    ChaCha blocks (each recorded as a separate sequence entry).
+    Returns numpy array shape (N,) dtype uint8.
+    """
+    byte_sequences = load_sequences_as_bytes(filepath)
+    stream = np.concatenate(byte_sequences)
+    print(f"Concatenated into single stream: {len(stream):,} bytes")
+    return stream
+
+
+# ── Fixed-key stream dataset (main approach) ──────────────────────────
+
+class ChaChaStreamDataset(Dataset):
+    """Sliding-window next-byte prediction dataset from a single keystream.
+
+    Input:  window of `window_size` consecutive bytes -> shape (window_size,) long
+    Target: next byte after the window -> scalar long (0-255)
+
+    Train/val split is done temporally (by position) before constructing
+    this dataset, so pass the appropriate slice of the stream.
+    """
+
+    def __init__(self, stream: np.ndarray, window_size: int = 64):
+        self.window_size = window_size
+        # Keep as uint8 numpy array; convert to tensor on access to save RAM
+        self.data = torch.from_numpy(stream.astype(np.int64))
+        self.n_samples = max(0, len(stream) - window_size)
+        print(f"  StreamDataset: {self.n_samples:,} samples "
+              f"(stream={len(stream):,} bytes, window={window_size})")
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        x = self.data[idx : idx + self.window_size]          # (window_size,)
+        y = self.data[idx + self.window_size]                # scalar
+        return x, y
+
+
+def get_stream_dataloaders(
+    filepath: str,
+    window_size: int = 64,
+    batch_size: int = 1024,
+    train_ratio: float = 0.8,
+    num_workers: int = 4,
+    flat: bool = False,
+):
+    """Build train/val DataLoaders for fixed-key next-byte prediction.
+
+    Args:
+        filepath:    Path to the keystream binary file.
+        window_size: Number of preceding bytes fed as input.
+        batch_size:  Mini-batch size.
+        train_ratio: Fraction of stream used for training (temporal split).
+        num_workers: DataLoader worker processes.
+        flat:        True  -> file is raw bytes (no length headers)
+                     False -> file has u32 length-prefixed sequences
+    """
+    if flat:
+        stream = load_flat_bytes(filepath)
+    else:
+        stream = load_single_stream_as_bytes(filepath)
+
+    split = int(len(stream) * train_ratio)
+    train_stream = stream[:split]
+    val_stream = stream[split:]
+
+    print("Train set:")
+    train_ds = ChaChaStreamDataset(train_stream, window_size)
+    print("Val set:")
+    val_ds = ChaChaStreamDataset(val_stream, window_size)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
     )
-    return bits.astype(np.float32)
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+    return train_loader, val_loader
 
 
-# ── Block-level dataset (64-byte block -> next 64-byte block) ─────────
+# ── Legacy: block-level datasets (kept for compatibility) ─────────────
 
-BLOCK_BYTES = 64  # ChaCha block = 16 x u32 = 64 bytes
+BLOCK_BYTES = 64
+
 
 class ChaChaBlockDataset(Dataset):
-    """Block-to-block prediction dataset.
-
-    Input: one 64-byte block as long tensor -> shape (64,)
-    Target: next 64-byte block as long tensor -> shape (64,)
-    Each byte is 0-255 (256-class per position).
-    """
+    """Block-to-block prediction dataset (legacy)."""
 
     def __init__(self, sequences, block_size: int = BLOCK_BYTES):
         self.block_size = block_size
         self.samples = []
-
         for seq in sequences:
             t = torch.from_numpy(seq.copy()).long()
             n_blocks = len(t) // block_size
@@ -72,89 +151,22 @@ class ChaChaBlockDataset(Dataset):
                 x = t[b * block_size : (b + 1) * block_size]
                 y = t[(b + 1) * block_size : (b + 2) * block_size]
                 self.samples.append((x, y))
-
         print(f"  Created {len(self.samples):,} block pairs (block_size={block_size})")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.samples[idx]  # (x: (64,), y: (64,))
+        return self.samples[idx]
 
-
-class ChaChaBlockToByteDataset(Dataset):
-    """Block-to-next-byte prediction dataset.
-
-    Input: one 64-byte block as long tensor -> shape (64,)
-    Target: first byte of next block as long scalar (0-255)
-    """
-
-    def __init__(self, sequences, block_size: int = BLOCK_BYTES):
-        self.block_size = block_size
-        self.samples = []
-
-        for seq in sequences:
-            t = torch.from_numpy(seq.copy()).long()
-            n_blocks = len(t) // block_size
-            for b in range(n_blocks - 1):
-                x = t[b * block_size : (b + 1) * block_size]          # (64,)
-                y = t[(b + 1) * block_size]                            # scalar
-                self.samples.append((x, y))
-
-        print(f"  Created {len(self.samples):,} block->byte pairs (block_size={block_size})")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]  # (x: (64,), y: scalar)
-
-
-def get_block_dataloaders(
-    filepath: str,
-    mode: str = "block64",
-    batch_size: int = 1024,
-    train_ratio: float = 0.8,
-    num_workers: int = 4,
-):
-    """Load data as bytes and return train/val DataLoaders.
-
-    mode="block64": predict next 64-byte block
-    mode="byte1":   predict first byte of next block
-    """
-    sequences = load_sequences_as_bytes(filepath)
-
-    split = int(len(sequences) * train_ratio)
-    train_seqs = sequences[:split]
-    val_seqs = sequences[split:]
-
-    ds_cls = ChaChaBlockDataset if mode == "block64" else ChaChaBlockToByteDataset
-
-    print(f"Mode: {mode}")
-    print("Train set:")
-    train_ds = ds_cls(train_seqs)
-    print("Val set:")
-    val_ds = ds_cls(val_seqs)
-
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
-    )
-    return train_loader, val_loader
-
-
-# ── Byte-level dataset (paper approach, kept for compatibility) ───────
 
 class ChaChaByteDataset(Dataset):
-    """Sliding window dataset for next-byte prediction (256-class)."""
+    """Sliding window next-byte prediction across multiple sequences (legacy)."""
 
     def __init__(self, sequences, window_size: int = 100):
         self.window_size = window_size
         self.samples = []
         self.seq_data = []
-
         for seq in sequences:
             t = torch.from_numpy(seq.copy()).long()
             self.seq_data.append(t)
@@ -180,73 +192,17 @@ def get_byte_dataloaders(
     train_ratio: float = 0.8,
     num_workers: int = 4,
 ):
-    """Load data as bytes and return train/val DataLoaders for next-byte prediction."""
     sequences = load_sequences_as_bytes(filepath)
-
     split = int(len(sequences) * train_ratio)
-    train_seqs = sequences[:split]
-    val_seqs = sequences[split:]
-
-    train_ds = ChaChaByteDataset(train_seqs, window_size)
-    val_ds = ChaChaByteDataset(val_seqs, window_size)
-
-    print(f"Train samples: {len(train_ds):,}, Val samples: {len(val_ds):,}")
-
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
-    )
-    return train_loader, val_loader
-
-
-# ── Bit-level dataset (old approach, kept for compatibility) ─────────
-
-class ChaChaSequenceDataset(Dataset):
-    def __init__(self, sequences, window_size: int = 4, flatten: bool = True):
-        self.window_size = window_size
-        self.flatten = flatten
-        self.samples = []
-        self.seq_bits = []
-
-        for seq in sequences:
-            bits = torch.from_numpy(u32_to_bits(seq))
-            self.seq_bits.append(bits)
-            seq_idx = len(self.seq_bits) - 1
-            for pos in range(len(seq) - window_size):
-                self.samples.append((seq_idx, pos))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        seq_idx, pos = self.samples[idx]
-        bits = self.seq_bits[seq_idx]
-        x = bits[pos : pos + self.window_size]
-        y = bits[pos + self.window_size]
-        if self.flatten:
-            x = x.reshape(-1)
-        return x, y
-
-
-def get_dataloaders(
-    filepath: str,
-    window_size: int = 4,
-    batch_size: int = 1024,
-    train_ratio: float = 0.8,
-    flatten: bool = True,
-    num_workers: int = 4,
-):
-    sequences = load_sequences(filepath)
-    split = int(len(sequences) * train_ratio)
-    train_ds = ChaChaSequenceDataset(sequences[:split], window_size, flatten=flatten)
-    val_ds = ChaChaSequenceDataset(sequences[split:], window_size, flatten=flatten)
+    train_ds = ChaChaByteDataset(sequences[:split], window_size)
+    val_ds = ChaChaByteDataset(sequences[split:], window_size)
     print(f"Train samples: {len(train_ds):,}, Val samples: {len(val_ds):,}")
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
     )
     return train_loader, val_loader
