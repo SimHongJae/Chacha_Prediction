@@ -133,9 +133,78 @@ def get_stream_dataloaders(
     return train_loader, val_loader
 
 
-# ── Legacy: block-level datasets (kept for compatibility) ─────────────
+# ── Block-pair dataset (block N → block N+1 prediction) ──────────────
 
 BLOCK_BYTES = 64
+
+
+class ChaChaBlockPairDataset(Dataset):
+    """Block-pair prediction dataset from a flat keystream.
+
+    Input:  block N   -> shape (64,) long (byte values 0-255)
+    Target: block N+1 -> shape (64,) long (byte values 0-255)
+
+    Splits are done on block boundaries to avoid leakage.
+    """
+
+    def __init__(self, stream: np.ndarray):
+        n_blocks = len(stream) // BLOCK_BYTES
+        stream = stream[: n_blocks * BLOCK_BYTES]
+        blocks = torch.from_numpy(stream.astype(np.int64)).view(n_blocks, BLOCK_BYTES)
+        self.x = blocks[:-1]  # blocks 0 .. N-2
+        self.y = blocks[1:]   # blocks 1 .. N-1
+        print(f"  BlockPairDataset: {len(self.x):,} pairs from {n_blocks:,} blocks")
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+
+def get_block_pair_dataloaders(
+    filepath: str,
+    batch_size: int = 256,
+    train_ratio: float = 0.8,
+    num_workers: int = 4,
+    flat: bool = True,
+):
+    """Build train/val DataLoaders for block-pair (block N → block N+1) prediction.
+
+    Args:
+        filepath:    Path to keystream binary file.
+        batch_size:  Mini-batch size.
+        train_ratio: Fraction of blocks used for training (split on block boundary).
+        num_workers: DataLoader worker processes.
+        flat:        True  -> file is raw bytes (no length headers)
+                     False -> file has u32 length-prefixed sequences
+    """
+    if flat:
+        stream = load_flat_bytes(filepath)
+    else:
+        stream = load_single_stream_as_bytes(filepath)
+
+    n_blocks = len(stream) // BLOCK_BYTES
+    split_block = int(n_blocks * train_ratio)
+    split_byte = split_block * BLOCK_BYTES
+
+    print("Train set:")
+    train_ds = ChaChaBlockPairDataset(stream[:split_byte])
+    print("Val set:")
+    val_ds = ChaChaBlockPairDataset(stream[split_byte:])
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+    return train_loader, val_loader
+
+
+# ── Legacy: block-level datasets (kept for compatibility) ─────────────
 
 
 class ChaChaBlockDataset(Dataset):

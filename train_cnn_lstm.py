@@ -1,15 +1,15 @@
-"""CNN+LSTM fixed-key next-byte prediction for ChaCha keystream analysis.
+"""CNN+LSTM ChaCha keystream analysis.
 
-Task: Given a fixed key, observe W consecutive keystream bytes and predict
-      the next byte (256-class classification).
-
-Model: Embedding -> CNN (Conv1d) -> LSTM -> FC -> 256 logits
-Metric: Pml (prediction-at-most-likely), baseline Pg = 1/256 ≈ 0.39%
+Modes (--mode):
+  next-byte  : given W consecutive bytes, predict the next byte (256-class).
+               Metric: Pml vs Pg = 1/256 ≈ 0.39%
+  block      : given block N (64 bytes), predict block N+1 (64 bytes).
+               Loss: mean CrossEntropy over 64 output positions.
+               Metric: mean per-byte Pml vs Pg = 1/256
 
 Data file formats supported:
   --flat : raw byte dump (no headers)  ← single fixed-key stream
-  default: u32 length-prefixed multi-sequence format (all sequences
-           concatenated into one stream before use)
+  default: u32 length-prefixed multi-sequence format
 """
 
 import argparse
@@ -20,23 +20,32 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import vessl
 from tqdm import tqdm
-from chacha_dataset import get_stream_dataloaders
+from chacha_dataset import get_stream_dataloaders, get_block_pair_dataloaders
 
 
 # ── Model ─────────────────────────────────────────────────────────────
 
+BLOCK_SIZE = 64
+
+
 class CNN_LSTM(nn.Module):
-    """Embedding -> CNN -> LSTM -> FC for next-byte prediction.
+    """Embedding -> CNN -> LSTM -> FC.
+
+    Modes:
+      next-byte: input (batch, window_size), output (batch, 256)
+      block    : input (batch, 64),          output (batch, 64, 256)
+                 — predicts each byte of the next block independently.
 
     Args:
         vocab_size:     256 (byte alphabet)
-        window_size:    number of input bytes (sequence length for CNN/LSTM)
+        window_size:    number of input bytes (ignored in block mode, always 64)
         embed_dim:      byte embedding dimension
         cnn_channels:   list of output channels for successive Conv1d layers
         kernel_size:    conv kernel size (same for all layers)
         lstm_hidden:    LSTM hidden state size
         lstm_layers:    number of stacked LSTM layers
         lstm_dropout:   dropout between LSTM layers (only if lstm_layers > 1)
+        block_mode:     if True, output (batch, 64, 256) for block prediction
     """
 
     def __init__(
@@ -49,11 +58,13 @@ class CNN_LSTM(nn.Module):
         lstm_hidden: int = 256,
         lstm_layers: int = 2,
         lstm_dropout: float = 0.2,
+        block_mode: bool = False,
     ):
         super().__init__()
         if cnn_channels is None:
             cnn_channels = [64, 128]
 
+        self.block_mode = block_mode
         self.embedding = nn.Embedding(vocab_size, embed_dim)
 
         # Build CNN: each block = Conv1d -> ReLU -> MaxPool1d(2)
@@ -77,17 +88,27 @@ class CNN_LSTM(nn.Module):
             dropout=lstm_dropout if lstm_layers > 1 else 0.0,
         )
 
-        self.fc = nn.Linear(lstm_hidden, vocab_size)
+        if block_mode:
+            # Predict all 64 output bytes at once from the final hidden state
+            self.fc = nn.Linear(lstm_hidden, BLOCK_SIZE * vocab_size)
+        else:
+            self.fc = nn.Linear(lstm_hidden, vocab_size)
+
+        self.vocab_size = vocab_size
 
     def forward(self, x):
-        # x: (batch, window_size)  long
-        x = self.embedding(x)           # (batch, window_size, embed_dim)
-        x = x.permute(0, 2, 1)          # (batch, embed_dim, window_size)
+        # x: (batch, seq_len)  long
+        x = self.embedding(x)           # (batch, seq_len, embed_dim)
+        x = x.permute(0, 2, 1)          # (batch, embed_dim, seq_len)
         x = self.cnn(x)                 # (batch, cnn_out_ch, seq_len')
         x = x.permute(0, 2, 1)          # (batch, seq_len', cnn_out_ch)
         out, _ = self.lstm(x)
         out = out[:, -1, :]             # (batch, lstm_hidden)
-        return self.fc(out)             # (batch, 256)
+        logits = self.fc(out)
+        if self.block_mode:
+            # (batch, BLOCK_SIZE * vocab_size) -> (batch, BLOCK_SIZE, vocab_size)
+            return logits.view(logits.size(0), BLOCK_SIZE, self.vocab_size)
+        return logits                   # (batch, vocab_size)
 
 
 # ── Evaluate ──────────────────────────────────────────────────────────
@@ -101,15 +122,26 @@ def evaluate(model, loader, criterion, device):
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            logits = model(x)                       # (batch, 256)
-            loss = criterion(logits, y)
+            logits = model(x)
+
+            if model.block_mode:
+                # logits: (batch, 64, 256)  y: (batch, 64)
+                # CrossEntropyLoss expects (batch, C, ...) and (batch, ...)
+                loss = criterion(logits.permute(0, 2, 1), y)
+                preds = logits.argmax(dim=2)              # (batch, 64)
+                total_correct += (preds == y).sum().item()
+                total_samples += x.size(0) * BLOCK_SIZE  # per-byte accuracy
+            else:
+                # logits: (batch, 256)  y: (batch,)
+                loss = criterion(logits, y)
+                preds = logits.argmax(dim=1)
+                total_correct += (preds == y).sum().item()
+                total_samples += x.size(0)
+
             total_loss += loss.item() * x.size(0)
-            preds = logits.argmax(dim=1)
-            total_correct += (preds == y).sum().item()
-            total_samples += x.size(0)
 
     return {
-        "loss": total_loss / total_samples,
+        "loss": total_loss / (total_samples if not model.block_mode else total_samples // BLOCK_SIZE),
         "pml": total_correct / total_samples,
     }
 
@@ -129,7 +161,12 @@ def train(model, train_loader, val_loader, optimizer, scheduler, criterion, devi
         for x, y in pbar:
             x, y = x.to(device), y.to(device)
             logits = model(x)
-            loss = criterion(logits, y)
+
+            if model.block_mode:
+                # logits: (batch, 64, 256)  y: (batch, 64)
+                loss = criterion(logits.permute(0, 2, 1), y)
+            else:
+                loss = criterion(logits, y)
 
             optimizer.zero_grad()
             loss.backward()
@@ -184,7 +221,8 @@ def plot_results(history, args):
     axes[0].plot(history["val_loss"], label="Val")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Cross-Entropy Loss")
-    axes[0].set_title(f"CNN+LSTM - ChaCha{args.rounds} (window={args.window_size})")
+    mode_label = "block→block" if args.mode == "block" else f"next-byte (w={args.window_size})"
+    axes[0].set_title(f"CNN+LSTM - ChaCha{args.rounds} ({mode_label})")
     axes[0].legend()
     axes[0].grid(True)
 
@@ -194,12 +232,13 @@ def plot_results(history, args):
     axes[1].axhline(y=pg * 100, color="r", linestyle="--", label=f"Pg ({pg:.2%})")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Accuracy (%)")
-    axes[1].set_title(f"CNN+LSTM Next-Byte Prediction - ChaCha{args.rounds}")
+    axes[1].set_title(f"CNN+LSTM ({args.mode}) - ChaCha{args.rounds}")
     axes[1].legend()
     axes[1].grid(True)
 
     plt.tight_layout()
-    fname = f"cnn_lstm_chacha{args.rounds}_w{args.window_size}_results.png"
+    suffix = "block" if args.mode == "block" else f"w{args.window_size}"
+    fname = f"cnn_lstm_chacha{args.rounds}_{suffix}_results.png"
     plt.savefig(fname, dpi=150)
     print(f"Plot saved to {fname}")
     plt.close()
@@ -209,29 +248,42 @@ def plot_results(history, args):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    block_mode = (args.mode == "block")
     print(f"Device: {device}")
+    print(f"Mode: {args.mode}")
     print(f"ChaCha rounds: {args.rounds}")
-    print(f"Window size: {args.window_size} bytes")
     print(f"Data file: {args.data}  (flat={args.flat})")
 
-    train_loader, val_loader = get_stream_dataloaders(
-        filepath=args.data,
-        window_size=args.window_size,
-        batch_size=args.batch_size,
-        train_ratio=0.8,
-        num_workers=args.num_workers,
-        flat=args.flat,
-    )
+    if block_mode:
+        print("Block mode: input=block N (64 bytes), output=block N+1 (64 bytes)")
+        train_loader, val_loader = get_block_pair_dataloaders(
+            filepath=args.data,
+            batch_size=args.batch_size,
+            train_ratio=0.8,
+            num_workers=args.num_workers,
+            flat=args.flat,
+        )
+    else:
+        print(f"Next-byte mode: window_size={args.window_size} bytes")
+        train_loader, val_loader = get_stream_dataloaders(
+            filepath=args.data,
+            window_size=args.window_size,
+            batch_size=args.batch_size,
+            train_ratio=0.8,
+            num_workers=args.num_workers,
+            flat=args.flat,
+        )
 
     model = CNN_LSTM(
         vocab_size=256,
-        window_size=args.window_size,
+        window_size=BLOCK_SIZE if block_mode else args.window_size,
         embed_dim=args.embed_dim,
         cnn_channels=args.cnn_channels,
         kernel_size=args.kernel_size,
         lstm_hidden=args.lstm_hidden,
         lstm_layers=args.lstm_layers,
         lstm_dropout=args.lstm_dropout,
+        block_mode=block_mode,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -247,7 +299,8 @@ def main(args):
     history = train(model, train_loader, val_loader, optimizer, scheduler, criterion, device, args)
     plot_results(history, args)
 
-    fname = f"cnn_lstm_chacha{args.rounds}_w{args.window_size}.pt"
+    suffix = "block" if args.mode == "block" else f"w{args.window_size}"
+    fname = f"cnn_lstm_chacha{args.rounds}_{suffix}.pt"
     torch.save(model.state_dict(), fname)
     print(f"Model saved to {fname}")
 
@@ -256,7 +309,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="CNN+LSTM next-byte prediction on ChaCha fixed-key keystream"
     )
-    # Data
+    # Data / mode
+    parser.add_argument("--mode", choices=["next-byte", "block"], default="block",
+                        help="next-byte: sliding window → 1 byte | block: block N → block N+1")
     parser.add_argument("--data", default="dataset/chacha4_stream.bin",
                         help="Path to keystream binary file")
     parser.add_argument("--flat", action="store_true",
@@ -264,7 +319,7 @@ if __name__ == "__main__":
     parser.add_argument("--rounds", type=int, default=4,
                         help="Number of ChaCha rounds (for labeling only)")
     parser.add_argument("--window-size", type=int, default=64,
-                        help="Sliding window size (bytes fed as input)")
+                        help="Sliding window size in next-byte mode (ignored in block mode)")
 
     # Training
     parser.add_argument("--batch-size", type=int, default=1024)
