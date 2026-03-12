@@ -395,7 +395,7 @@ if __name__ == "__main__":
         help="Sliding window size in next-byte mode  (paper: N=100)")
 
     # ── Training ──────────────────────────────────────────────────────
-    parser.add_argument("--batch-size",   type=int,   default=1024)
+    parser.add_argument("--batch-size",   type=int,   default=8192)
     parser.add_argument("--epochs",       type=int,   default=30)
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--num-workers",  type=int,   default=0)
