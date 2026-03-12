@@ -204,6 +204,104 @@ def get_block_pair_dataloaders(
     return train_loader, val_loader
 
 
+# ── Sweep datasets: fixed key, vary only counter or nonce ─────────────
+
+class ChaChaCounterDataset(Dataset):
+    """Counter-sweep dataset: input=counter(4 bytes), output=block(64 bytes).
+
+    Reads a flat stream file (chacha{R}_stream.bin).
+    Counter for block at position N is simply N — no extra storage needed.
+
+    Input:  counter as 4 uint8 values (little-endian) -> shape (4,) long
+    Target: 64-byte block output                       -> shape (64,) long
+    """
+
+    def __init__(self, stream: np.ndarray):
+        n_blocks = len(stream) // BLOCK_BYTES
+        stream = stream[: n_blocks * BLOCK_BYTES]
+        blocks = torch.from_numpy(stream.astype(np.int64)).view(n_blocks, BLOCK_BYTES)
+        # Build counter tensors: counter N -> 4 bytes little-endian
+        counters = np.arange(n_blocks, dtype=np.uint32).view(np.uint8).reshape(n_blocks, 4)
+        self.x = torch.from_numpy(counters.astype(np.int64))  # (N, 4)
+        self.y = blocks                                         # (N, 64)
+        print(f"  CounterDataset: {n_blocks:,} samples (input=4B counter, output=64B block)")
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+
+class ChaChaNonceDataset(Dataset):
+    """Nonce-sweep dataset: input=nonce(12 bytes), output=block(64 bytes).
+
+    Reads a nonce-sweep file (chacha{R}_nonce_sweep.bin).
+    Record format: [nonce: 12 bytes][block_output: 64 bytes] = 76 bytes each.
+
+    Input:  nonce as 12 uint8 values -> shape (12,) long
+    Target: 64-byte block output     -> shape (64,) long
+    """
+
+    RECORD = 76  # 12 + 64
+
+    def __init__(self, data: np.ndarray):
+        assert len(data) % self.RECORD == 0, "File size not a multiple of 76"
+        n = len(data) // self.RECORD
+        records = data.reshape(n, self.RECORD)
+        self.x = torch.from_numpy(records[:, :12].astype(np.int64))   # (N, 12)
+        self.y = torch.from_numpy(records[:, 12:].astype(np.int64))   # (N, 64)
+        print(f"  NonceDataset: {n:,} samples (input=12B nonce, output=64B block)")
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+
+def get_counter_dataloaders(
+    filepath: str,
+    batch_size: int = 512,
+    train_ratio: float = 0.8,
+    num_workers: int = 0,
+):
+    """Train/val loaders for counter-sweep (reads flat stream file)."""
+    stream = load_flat_bytes(filepath)
+    n_blocks = len(stream) // BLOCK_BYTES
+    split = int(n_blocks * train_ratio) * BLOCK_BYTES
+
+    print("Train set:")
+    train_ds = ChaChaCounterDataset(stream[:split])
+    print("Val set:")
+    val_ds = ChaChaCounterDataset(stream[split:])
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    return train_loader, val_loader
+
+
+def get_nonce_dataloaders(
+    filepath: str,
+    batch_size: int = 512,
+    train_ratio: float = 0.8,
+    num_workers: int = 0,
+):
+    """Train/val loaders for nonce-sweep (reads nonce_sweep.bin file)."""
+    data = np.fromfile(filepath, dtype=np.uint8)
+    n = len(data) // 76
+    split = int(n * train_ratio) * 76
+
+    print("Train set:")
+    train_ds = ChaChaNonceDataset(data[:split])
+    print("Val set:")
+    val_ds   = ChaChaNonceDataset(data[split:])
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    return train_loader, val_loader
+
+
 # ── Legacy: block-level datasets (kept for compatibility) ─────────────
 
 
