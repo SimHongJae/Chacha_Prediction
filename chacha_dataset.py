@@ -1,3 +1,16 @@
+"""
+Dataset utilities for ChaCha keystream cryptanalysis.
+
+Paper: "Strengthening the No-Go Theorem for QRNGs" (arXiv:2503.18026v2, 2025)
+
+Main dataset for paper reproduction (Section II.3.1, Case III):
+  ChaChaStreamDataset  — sliding-window next-byte prediction.
+    window_size = 100  (paper: N=100 previous 8-bit integers)
+    Returns (x, y) where x is long indices 0-255; the CNN_LSTM model
+    applies one-hot encoding internally in its forward() method.
+    See train_cnn_lstm.py for the full pipeline.
+"""
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -48,33 +61,30 @@ def load_sequences_as_bytes(filepath: str):
 
 
 def load_single_stream_as_bytes(filepath: str) -> np.ndarray:
-    """Load multi-sequence binary file, concatenate all into one byte stream.
-
-    Use this when the file contains one key's worth of data across multiple
-    ChaCha blocks (each recorded as a separate sequence entry).
-    Returns numpy array shape (N,) dtype uint8.
-    """
+    """Load multi-sequence binary file, concatenate all into one byte stream."""
     byte_sequences = load_sequences_as_bytes(filepath)
     stream = np.concatenate(byte_sequences)
     print(f"Concatenated into single stream: {len(stream):,} bytes")
     return stream
 
 
-# ── Fixed-key stream dataset (main approach) ──────────────────────────
+# ── Fixed-key stream dataset (paper Section II.3.1) ──────────────────
 
 class ChaChaStreamDataset(Dataset):
     """Sliding-window next-byte prediction dataset from a single keystream.
 
-    Input:  window of `window_size` consecutive bytes -> shape (window_size,) long
-    Target: next byte after the window -> scalar long (0-255)
+    Paper: arXiv:2503.18026v2, Section II.3.1
+      N = 100 consecutive 8-bit integers as input → predict next byte.
+      One-hot encoding is applied inside the CNN_LSTM model's forward().
 
-    Train/val split is done temporally (by position) before constructing
-    this dataset, so pass the appropriate slice of the stream.
+    Input  (x) : window of `window_size` bytes → shape (window_size,) int64
+    Target (y) : next byte after the window    → scalar int64 (0-255)
+
+    Train/val split is temporal (by stream position) to avoid leakage.
     """
 
-    def __init__(self, stream: np.ndarray, window_size: int = 64):
+    def __init__(self, stream: np.ndarray, window_size: int = 100):
         self.window_size = window_size
-        # Keep as uint8 numpy array; convert to tensor on access to save RAM
         self.data = torch.from_numpy(stream.astype(np.int64))
         self.n_samples = max(0, len(stream) - window_size)
         print(f"  StreamDataset: {self.n_samples:,} samples "
@@ -84,43 +94,45 @@ class ChaChaStreamDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx):
-        x = self.data[idx : idx + self.window_size]          # (window_size,)
-        y = self.data[idx + self.window_size]                # scalar
+        x = self.data[idx : idx + self.window_size]    # (window_size,) int64
+        y = self.data[idx + self.window_size]           # scalar int64
         return x, y
 
 
 def get_stream_dataloaders(
-    filepath: str,
-    window_size: int = 64,
-    batch_size: int = 1024,
-    train_ratio: float = 0.8,
-    num_workers: int = 4,
-    flat: bool = False,
+    filepath    : str,
+    window_size : int   = 100,
+    batch_size  : int   = 1024,
+    train_ratio : float = 0.8,
+    num_workers : int   = 0,
+    flat        : bool  = True,
 ):
     """Build train/val DataLoaders for fixed-key next-byte prediction.
 
+    Paper (Section II.3.1): window_size=100, flat=True (chacha_raw_5M.bin).
+
     Args:
-        filepath:    Path to the keystream binary file.
-        window_size: Number of preceding bytes fed as input.
-        batch_size:  Mini-batch size.
-        train_ratio: Fraction of stream used for training (temporal split).
-        num_workers: DataLoader worker processes.
-        flat:        True  -> file is raw bytes (no length headers)
-                     False -> file has u32 length-prefixed sequences
+        filepath    : Path to the keystream binary file.
+        window_size : Number of preceding bytes fed as input  (paper: 100).
+        batch_size  : Mini-batch size.
+        train_ratio : Fraction of stream used for training (temporal split).
+        num_workers : DataLoader worker processes.
+        flat        : True  → file is raw bytes (no length headers)
+                      False → file has u32 length-prefixed sequences
     """
     if flat:
         stream = load_flat_bytes(filepath)
     else:
         stream = load_single_stream_as_bytes(filepath)
 
-    split = int(len(stream) * train_ratio)
+    split       = int(len(stream) * train_ratio)
     train_stream = stream[:split]
-    val_stream = stream[split:]
+    val_stream   = stream[split:]
 
     print("Train set:")
     train_ds = ChaChaStreamDataset(train_stream, window_size)
     print("Val set:")
-    val_ds = ChaChaStreamDataset(val_stream, window_size)
+    val_ds   = ChaChaStreamDataset(val_stream,   window_size)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -139,20 +151,14 @@ BLOCK_BYTES = 64
 
 
 class ChaChaBlockPairDataset(Dataset):
-    """Block-pair prediction dataset from a flat keystream.
-
-    Input:  block N   -> shape (64,) long (byte values 0-255)
-    Target: block N+1 -> shape (64,) long (byte values 0-255)
-
-    Splits are done on block boundaries to avoid leakage.
-    """
+    """Block-pair prediction: input=block_N (64 bytes), target=block_{N+1}."""
 
     def __init__(self, stream: np.ndarray):
         n_blocks = len(stream) // BLOCK_BYTES
-        stream = stream[: n_blocks * BLOCK_BYTES]
-        blocks = torch.from_numpy(stream.astype(np.int64)).view(n_blocks, BLOCK_BYTES)
-        self.x = blocks[:-1]  # blocks 0 .. N-2
-        self.y = blocks[1:]   # blocks 1 .. N-1
+        stream   = stream[: n_blocks * BLOCK_BYTES]
+        blocks   = torch.from_numpy(stream.astype(np.int64)).view(n_blocks, BLOCK_BYTES)
+        self.x = blocks[:-1]   # blocks 0 .. N-2
+        self.y = blocks[1:]    # blocks 1 .. N-1
         print(f"  BlockPairDataset: {len(self.x):,} pairs from {n_blocks:,} blocks")
 
     def __len__(self):
@@ -163,35 +169,26 @@ class ChaChaBlockPairDataset(Dataset):
 
 
 def get_block_pair_dataloaders(
-    filepath: str,
-    batch_size: int = 256,
-    train_ratio: float = 0.8,
-    num_workers: int = 4,
-    flat: bool = True,
+    filepath    : str,
+    batch_size  : int   = 256,
+    train_ratio : float = 0.8,
+    num_workers : int   = 0,
+    flat        : bool  = True,
 ):
-    """Build train/val DataLoaders for block-pair (block N → block N+1) prediction.
-
-    Args:
-        filepath:    Path to keystream binary file.
-        batch_size:  Mini-batch size.
-        train_ratio: Fraction of blocks used for training (split on block boundary).
-        num_workers: DataLoader worker processes.
-        flat:        True  -> file is raw bytes (no length headers)
-                     False -> file has u32 length-prefixed sequences
-    """
+    """Build train/val DataLoaders for block-pair prediction."""
     if flat:
         stream = load_flat_bytes(filepath)
     else:
         stream = load_single_stream_as_bytes(filepath)
 
-    n_blocks = len(stream) // BLOCK_BYTES
+    n_blocks    = len(stream) // BLOCK_BYTES
     split_block = int(n_blocks * train_ratio)
-    split_byte = split_block * BLOCK_BYTES
+    split_byte  = split_block * BLOCK_BYTES
 
     print("Train set:")
     train_ds = ChaChaBlockPairDataset(stream[:split_byte])
     print("Val set:")
-    val_ds = ChaChaBlockPairDataset(stream[split_byte:])
+    val_ds   = ChaChaBlockPairDataset(stream[split_byte:])
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -204,27 +201,19 @@ def get_block_pair_dataloaders(
     return train_loader, val_loader
 
 
-# ── Sweep datasets: fixed key, vary only counter or nonce ─────────────
+# ── Sweep datasets: fixed key, vary counter or nonce ─────────────────
 
 class ChaChaCounterDataset(Dataset):
-    """Counter-sweep dataset: input=counter(4 bytes), output=block(64 bytes).
-
-    Reads a flat stream file (chacha{R}_stream.bin).
-    Counter for block at position N is simply N — no extra storage needed.
-
-    Input:  counter as 4 uint8 values (little-endian) -> shape (4,) long
-    Target: 64-byte block output                       -> shape (64,) long
-    """
+    """Counter-sweep: input=counter(4B LE), output=64-byte block."""
 
     def __init__(self, stream: np.ndarray):
         n_blocks = len(stream) // BLOCK_BYTES
-        stream = stream[: n_blocks * BLOCK_BYTES]
-        blocks = torch.from_numpy(stream.astype(np.int64)).view(n_blocks, BLOCK_BYTES)
-        # Build counter tensors: counter N -> 4 bytes little-endian
+        stream   = stream[: n_blocks * BLOCK_BYTES]
+        blocks   = torch.from_numpy(stream.astype(np.int64)).view(n_blocks, BLOCK_BYTES)
         counters = np.arange(n_blocks, dtype=np.uint32).view(np.uint8).reshape(n_blocks, 4)
-        self.x = torch.from_numpy(counters.astype(np.int64))  # (N, 4)
-        self.y = blocks                                         # (N, 64)
-        print(f"  CounterDataset: {n_blocks:,} samples (input=4B counter, output=64B block)")
+        self.x = torch.from_numpy(counters.astype(np.int64))
+        self.y = blocks
+        print(f"  CounterDataset: {n_blocks:,} samples")
 
     def __len__(self):
         return len(self.x)
@@ -234,24 +223,18 @@ class ChaChaCounterDataset(Dataset):
 
 
 class ChaChaNonceDataset(Dataset):
-    """Nonce-sweep dataset: input=nonce(12 bytes), output=block(64 bytes).
-
-    Reads a nonce-sweep file (chacha{R}_nonce_sweep.bin).
+    """Nonce-sweep: input=nonce(12B), output=64-byte block.
     Record format: [nonce: 12 bytes][block_output: 64 bytes] = 76 bytes each.
-
-    Input:  nonce as 12 uint8 values -> shape (12,) long
-    Target: 64-byte block output     -> shape (64,) long
     """
-
-    RECORD = 76  # 12 + 64
+    RECORD = 76
 
     def __init__(self, data: np.ndarray):
         assert len(data) % self.RECORD == 0, "File size not a multiple of 76"
-        n = len(data) // self.RECORD
+        n       = len(data) // self.RECORD
         records = data.reshape(n, self.RECORD)
-        self.x = torch.from_numpy(records[:, :12].astype(np.int64))   # (N, 12)
-        self.y = torch.from_numpy(records[:, 12:].astype(np.int64))   # (N, 64)
-        print(f"  NonceDataset: {n:,} samples (input=12B nonce, output=64B block)")
+        self.x  = torch.from_numpy(records[:, :12].astype(np.int64))
+        self.y  = torch.from_numpy(records[:, 12:].astype(np.int64))
+        print(f"  NonceDataset: {n:,} samples")
 
     def __len__(self):
         return len(self.x)
@@ -261,35 +244,33 @@ class ChaChaNonceDataset(Dataset):
 
 
 def get_counter_dataloaders(
-    filepath: str,
-    batch_size: int = 512,
-    train_ratio: float = 0.8,
-    num_workers: int = 0,
+    filepath    : str,
+    batch_size  : int   = 512,
+    train_ratio : float = 0.8,
+    num_workers : int   = 0,
 ):
-    """Train/val loaders for counter-sweep (reads flat stream file)."""
-    stream = load_flat_bytes(filepath)
+    stream   = load_flat_bytes(filepath)
     n_blocks = len(stream) // BLOCK_BYTES
-    split = int(n_blocks * train_ratio) * BLOCK_BYTES
+    split    = int(n_blocks * train_ratio) * BLOCK_BYTES
 
     print("Train set:")
     train_ds = ChaChaCounterDataset(stream[:split])
     print("Val set:")
-    val_ds = ChaChaCounterDataset(stream[split:])
+    val_ds   = ChaChaCounterDataset(stream[split:])
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader
 
 
 def get_nonce_dataloaders(
-    filepath: str,
-    batch_size: int = 512,
-    train_ratio: float = 0.8,
-    num_workers: int = 0,
+    filepath    : str,
+    batch_size  : int   = 512,
+    train_ratio : float = 0.8,
+    num_workers : int   = 0,
 ):
-    """Train/val loaders for nonce-sweep (reads nonce_sweep.bin file)."""
-    data = np.fromfile(filepath, dtype=np.uint8)
-    n = len(data) // 76
+    data  = np.fromfile(filepath, dtype=np.uint8)
+    n     = len(data) // 76
     split = int(n * train_ratio) * 76
 
     print("Train set:")
@@ -297,22 +278,21 @@ def get_nonce_dataloaders(
     print("Val set:")
     val_ds   = ChaChaNonceDataset(data[split:])
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader
 
 
 # ── Legacy: block-level datasets (kept for compatibility) ─────────────
 
-
 class ChaChaBlockDataset(Dataset):
     """Block-to-block prediction dataset (legacy)."""
 
     def __init__(self, sequences, block_size: int = BLOCK_BYTES):
         self.block_size = block_size
-        self.samples = []
+        self.samples    = []
         for seq in sequences:
-            t = torch.from_numpy(seq.copy()).long()
+            t        = torch.from_numpy(seq.copy()).long()
             n_blocks = len(t) // block_size
             for b in range(n_blocks - 1):
                 x = t[b * block_size : (b + 1) * block_size]
@@ -332,8 +312,8 @@ class ChaChaByteDataset(Dataset):
 
     def __init__(self, sequences, window_size: int = 100):
         self.window_size = window_size
-        self.samples = []
-        self.seq_data = []
+        self.samples     = []
+        self.seq_data    = []
         for seq in sequences:
             t = torch.from_numpy(seq.copy()).long()
             self.seq_data.append(t)
@@ -347,29 +327,23 @@ class ChaChaByteDataset(Dataset):
     def __getitem__(self, idx):
         seq_idx, pos = self.samples[idx]
         data = self.seq_data[seq_idx]
-        x = data[pos : pos + self.window_size]
-        y = data[pos + self.window_size]
+        x    = data[pos : pos + self.window_size]
+        y    = data[pos + self.window_size]
         return x, y
 
 
 def get_byte_dataloaders(
-    filepath: str,
-    window_size: int = 100,
-    batch_size: int = 1024,
-    train_ratio: float = 0.8,
-    num_workers: int = 4,
+    filepath    : str,
+    window_size : int   = 100,
+    batch_size  : int   = 1024,
+    train_ratio : float = 0.8,
+    num_workers : int   = 4,
 ):
     sequences = load_sequences_as_bytes(filepath)
-    split = int(len(sequences) * train_ratio)
-    train_ds = ChaChaByteDataset(sequences[:split], window_size)
-    val_ds = ChaChaByteDataset(sequences[split:], window_size)
+    split     = int(len(sequences) * train_ratio)
+    train_ds  = ChaChaByteDataset(sequences[:split], window_size)
+    val_ds    = ChaChaByteDataset(sequences[split:],  window_size)
     print(f"Train samples: {len(train_ds):,}, Val samples: {len(val_ds):,}")
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader

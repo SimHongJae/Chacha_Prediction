@@ -15,6 +15,13 @@ dataset/*.bin
 # Training outputs
 *_results.png
 
-# IDE
+# IDE / tools
 .vscode/
 .idea/
+.claude/
+
+# Large binary data files
+*.bin
+
+# Generated datasets
+my_chacha/dataset.csv

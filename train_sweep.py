@@ -19,9 +19,15 @@ import sys
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
-import vessl
 from tqdm import tqdm
 from chacha_dataset import get_counter_dataloaders, get_nonce_dataloaders
+
+# Optional vessl logging (gracefully disabled when not installed)
+try:
+    import vessl
+    _VESSL = True
+except ImportError:
+    _VESSL = False
 
 BLOCK_SIZE = 64
 VOCAB_SIZE = 256
@@ -138,16 +144,17 @@ def train(model, train_loader, val_loader, optimizer, scheduler, device, args):
             f"LR: {lr:.2e}",
             flush=True,
         )
-        vessl.log(
-            step=epoch + 1,
-            payload={
-                "train_loss": train_loss,
-                "val_loss": metrics["loss"],
-                "pml": metrics["pml"],
-                "pml_over_pg": metrics["pml"] / pg,
-                "lr": lr,
-            },
-        )
+        if _VESSL:
+            vessl.log(
+                step=epoch + 1,
+                payload={
+                    "train_loss": train_loss,
+                    "val_loss": metrics["loss"],
+                    "pml": metrics["pml"],
+                    "pml_over_pg": metrics["pml"] / pg,
+                    "lr": lr,
+                },
+            )
 
     return history
 
@@ -213,7 +220,7 @@ def main(args):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3,
+        optimizer, mode="min", factor=0.5, patience=3
     )
 
     history = train(model, train_loader, val_loader, optimizer, scheduler, device, args)
